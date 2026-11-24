@@ -17,7 +17,8 @@ namespace Streaik.Mcp.Servers;
 
 internal static class Tools
 {
-    private const string OpenAiImageModel = "gpt_image_2_6_flare";
+    private const string OpenAiImageModel = "gpt-image-2.6-flare";
+    private const string GoogleImageModel = "gemini-nano-banana-2.1";
     private static readonly IReadOnlyDictionary<string, string> NoHeaders = ReadOnlyDictionary<string, string>.Empty;
 
     public static McpServerPrimitiveCollection<McpServerTool> For(string serverId)
@@ -89,15 +90,18 @@ internal static class Tools
         content.AddRange(images.Select(image => new ChatMessageImagePart { ImageUrl = new ChatMessageImageUrl { Url = image.DataUrl } }));
         var result = await services.GetRequiredService<OpenAIProvider>().CompleteChatAsync(new ChatCompletionOptions
         {
-            Model = RequiredText(model, 200), Store = false,
+            Model = ProviderModel(model, "openai/"), Store = false,
             Messages = [new ChatMessage { Role = "user", Content = content.ToArray() }]
         }, NoHeaders, ct);
         return Text(result.Choices.FirstOrDefault()?.Message?.Content is { } answer ? ChatMessageContentExtensions.ToText(answer) : null);
     }, ct);
 
     private static Task<CallToolResult> GoogleNanoBanana_CreateImage(
-        [Description("The image prompt.")] string prompt, string model, IServiceProvider services, CancellationToken ct,
-        string? fileUrl = null, string? aspectRatio = null, string? imageSize = null, string[]? referenceImageUrls = null) => Run(async ct =>
+        [Description("The image prompt.")] string prompt, IServiceProvider services, CancellationToken ct,
+        [Description("Gemini image generation model, e.g. gemini-nano-banana-2.1 or gemini-3.1-flash-lite-image.")] string model = GoogleImageModel,
+        string? fileUrl = null, [Description("Aspect ratio, e.g. 1:1 or 16:9. Omit for the model default.")] string? aspectRatio = null,
+        [Description("Case-sensitive resolution, e.g. 1K, 2K or 4K where supported. Flash Lite supports only 1K.")] string? imageSize = null,
+        string[]? referenceImageUrls = null) => Run(async ct =>
     {
         var urls = (fileUrl is null ? Enumerable.Empty<string>() : [fileUrl]).Concat(referenceImageUrls ?? []).ToArray();
         var input = await GoogleInput(services, urls, RequiredText(prompt), ct);
@@ -164,9 +168,10 @@ internal static class Tools
 
     private static async Task<JsonNode> GoogleInteraction(IServiceProvider services, string model, JsonArray input, JsonObject? format, CancellationToken ct)
     {
-        var payload = new JsonObject { ["model"] = RequiredText(model, 200), ["input"] = input, ["store"] = false, ["stream"] = false, ["background"] = false };
+        var payload = new JsonObject { ["model"] = ProviderModel(ProviderModel(model, "google/"), "models/"), ["input"] = input, ["store"] = false };
         if (format is not null) payload["response_format"] = format;
         using var request = new HttpRequestMessage(HttpMethod.Post, "v1beta/interactions") { Content = JsonContent.Create(payload) };
+        request.Headers.Accept.ParseAdd("application/json");
         request.Headers.Add("x-goog-api-key", Key(services, "google"));
         request.Headers.Add("Api-Revision", "2026-05-20");
         var result = JsonNode.Parse(await Send(services, "mcp-google", request, 8 * 1024 * 1024, ct)) ?? throw new JsonException();
@@ -183,7 +188,7 @@ internal static class Tools
     {
         using var client = services.GetRequiredService<IHttpClientFactory>().CreateClient(clientName);
         using var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, ct);
-        if (!response.IsSuccessStatusCode) throw new HttpRequestException($"Provider request failed (HTTP {(int)response.StatusCode}).");
+        response.EnsureSuccessStatusCode();
         return await ImageInputs.ReadBoundedAsync(response.Content, limit, ct);
     }
 
@@ -193,7 +198,13 @@ internal static class Tools
     private static string RequiredText(string value, int max = 16_384) => !string.IsNullOrWhiteSpace(value) && value.Length <= max
         ? value : throw new ArgumentException($"Expected nonempty text up to {max} characters.");
 
-    private static string ImageModel(string model) => RequiredText(model, 200) switch
+    private static string ProviderModel(string model, string prefix)
+    {
+        var name = RequiredText(model, 200).Trim();
+        return name.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) ? RequiredText(name[prefix.Length..], 200) : name;
+    }
+
+    private static string ImageModel(string model) => ProviderModel(model, "openai/") switch
     {
         var name when name.StartsWith("gpt_image_", StringComparison.Ordinal) => name.Replace("gpt_image_", "gpt-image-")
             .Replace("_6_", ".6-").Replace("_5_", ".5-").Replace("_", "-"),
@@ -228,7 +239,9 @@ internal static class Tools
         catch (OperationCanceledException) { return Failure("The operation timed out."); }
         catch (ProviderCredentialException) { return Failure("The provider credential is missing."); }
         catch (ArgumentException ex) when (ex.ParamName is null) { return Failure(ex.Message); }
-        catch (HttpRequestException) { return Failure("The upstream request failed. Check provider credentials and availability."); }
+        catch (McpProviderException ex) { return Failure(ex.Message); }
+        catch (HttpRequestException ex) { return Failure(ex.StatusCode is { } status
+            ? $"An upstream request failed (HTTP {(int)status})." : "Could not connect to the upstream service."); }
         catch (Exception ex) when (ex is JsonException or InvalidOperationException or InvalidDataException)
         { return Failure("The provider returned an unusable result."); }
     }

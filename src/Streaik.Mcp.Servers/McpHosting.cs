@@ -28,15 +28,16 @@ public static class McpHosting
     {
         services.AddHttpContextAccessor();
         services.AddOpenAI();
+        services.AddHttpClient(OpenAIProvider.Id).AddHttpMessageHandler(() => new ProviderErrors("OpenAI"));
         if (headerAuth)
             services.Replace(ServiceDescriptor.Scoped<IProviderCredentials, HeaderCredentials>());
         services.AddScoped<ImageInputs>();
         services.AddHttpClient("mcp-media", c => c.Timeout = TimeSpan.FromSeconds(20))
             .ConfigurePrimaryHttpMessageHandler(() => new SocketsHttpHandler { UseCookies = false, UseProxy = false, AllowAutoRedirect = false });
         services.AddHttpClient("mcp-google", c => c.BaseAddress = new Uri("https://generativelanguage.googleapis.com/"))
-            .ConfigurePrimaryHttpMessageHandler(ProviderHandler);
+            .ConfigurePrimaryHttpMessageHandler(ProviderHandler).AddHttpMessageHandler(() => new ProviderErrors("Google"));
         services.AddHttpClient("mcp-anthropic", c => c.BaseAddress = new Uri("https://api.anthropic.com/"))
-            .ConfigurePrimaryHttpMessageHandler(ProviderHandler);
+            .ConfigurePrimaryHttpMessageHandler(ProviderHandler).AddHttpMessageHandler(() => new ProviderErrors("Anthropic"));
         services.AddMcpServer(options => options.ProtocolVersion = ProtocolVersion).WithHttpTransport(options =>
         {
             options.SessionMode = HttpServerSessionMode.Stateless;
