@@ -24,6 +24,8 @@ public static class McpHosting
         new("anthropic-skills", "Anthropic-Skills", "Anthropic Skills", "1.0.0", "anthropic", "x-api-key")
     ];
 
+    public static IReadOnlyList<string> ServerIds { get; } = Array.AsReadOnly(Servers.Select(server => server.Id).ToArray());
+
     public static IServiceCollection AddStreaikMcp(this IServiceCollection services, IConfiguration configuration, bool headerAuth)
     {
         services.AddHttpContextAccessor();
@@ -59,7 +61,8 @@ public static class McpHosting
     }
 
     // Only transport routes are mapped here. Discovery is hosted separately.
-    public static void MapStreaikMcp(this WebApplication app, string? authorizationPolicy = null)
+    public static void MapStreaikMcp(this WebApplication app, string? authorizationPolicy = null,
+        Action<string, IEndpointConventionBuilder>? configureServer = null)
     {
         foreach (var server in Servers)
         {
@@ -67,6 +70,7 @@ public static class McpHosting
             endpoint.WithMetadata(server).RequireCors("StreaikMcp");
             if (authorizationPolicy is not null)
                 endpoint.RequireAuthorization(authorizationPolicy);
+            configureServer?.Invoke(server.Id, endpoint);
             endpoint.Add(builder =>
             {
                 var next = builder.RequestDelegate!;
