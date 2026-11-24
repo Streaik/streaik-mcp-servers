@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net11.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+    <PackageReference Include="ModelContextProtocol.AspNetCore" Version="2.4.0" />
+    <ProjectReference Include="../../../streaik-providers/src/Streaik.Providers/Streaik.Providers.csproj" />
+  </ItemGroup>
+</Project>

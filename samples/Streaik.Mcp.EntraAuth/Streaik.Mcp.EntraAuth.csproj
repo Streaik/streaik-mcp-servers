@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+  <PropertyGroup><TargetFramework>net11.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings><Nullable>enable</Nullable></PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Identity.Web" Version="4.18.0" />
+    <PackageReference Include="Microsoft.AspNetCore.Authentication.JwtBearer" Version="10.0.13" />
+    <PackageReference Include="Azure.Identity" Version="1.21.0" />
+    <PackageReference Include="Azure.Security.KeyVault.Secrets" Version="4.12.0" />
+    <ProjectReference Include="../../src/Streaik.Mcp.Servers/Streaik.Mcp.Servers.csproj" />
+  </ItemGroup>
+</Project>
