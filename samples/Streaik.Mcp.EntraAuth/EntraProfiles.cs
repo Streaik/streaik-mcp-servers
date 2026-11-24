@@ -4,14 +4,15 @@ using Streaik.Mcp.Servers;
 namespace Streaik.Mcp.EntraAuth;
 
 internal sealed record EntraProfile(string Name, string TenantId, string ClientId, string ClientSecret, string Scope,
-    IReadOnlySet<string> ExchangeClients, IReadOnlyDictionary<string, string> DownstreamScopes)
+    IReadOnlySet<string> ExchangeClients, string? V1Audience, IReadOnlySet<string> DirectBearerClients,
+    IReadOnlyDictionary<string, string> DownstreamScopes)
 {
     internal string Authority => $"https://login.microsoftonline.com/{TenantId}";
     internal string ScopeName => Scope[(Scope.LastIndexOf('/') + 1)..];
     internal string Route => $"/oauth/{Name}";
 }
 
-internal sealed record McpResource(EntraProfile Profile, string Url, string MetadataUrl);
+internal sealed record McpResource(EntraProfile Profile, string Url, string MetadataUrl, IReadOnlyDictionary<string, string>? Obo);
 
 internal sealed class EntraProfiles
 {
@@ -61,8 +62,10 @@ internal sealed class EntraProfiles
 
         var assignments = serverSection.GetChildren().ToDictionary(section => section.Key, section => section.Value, StringComparer.Ordinal);
         foreach (var (server, profile) in assignments)
-            if (!McpHosting.ServerIds.Contains(server) || profile is null || !profiles.ContainsKey(profile))
+        {
+            if (!McpCatalog.Servers.ContainsKey(server) || profile is null || !profiles.ContainsKey(profile))
                 throw Invalid($"{serverSection.Path}:{server}");
+        }
 
         var publicClients = new Dictionary<string, HashSet<string>>(StringComparer.Ordinal);
         foreach (var section in publicClientsSection.GetChildren())
@@ -74,9 +77,15 @@ internal sealed class EntraProfiles
             publicClients.Add(section.Key, redirects.ToHashSet(StringComparer.Ordinal));
         }
 
-        var servers = McpHosting.ServerIds.ToDictionary(id => id, id => new McpResource(
-            profiles[assignments.GetValueOrDefault(id) ?? "default"], $"{baseUri.AbsoluteUri.TrimEnd('/')}/{id}",
-            $"{baseUri.GetLeftPart(UriPartial.Authority)}{ResourceMetadata}{baseUri.AbsolutePath.TrimEnd('/')}/{id}"), StringComparer.Ordinal);
+        var servers = McpCatalog.Servers.ToDictionary(pair => pair.Key, pair =>
+        {
+            var (id, entry) = pair;
+            if (entry.Obo is { } obo && (obo.Count != 1 || !obo.TryGetValue(GraphReads.Target, out var scopes) ||
+                !IsDownstreamScopeSet(scopes, GraphReads.Origin + "/")))
+                throw Invalid($"MCP catalog OBO scopes for '{id}'");
+            return new McpResource(profiles[assignments.GetValueOrDefault(id) ?? "default"], $"{baseUri.AbsoluteUri.TrimEnd('/')}/{id}",
+                $"{baseUri.GetLeftPart(UriPartial.Authority)}{ResourceMetadata}{baseUri.AbsolutePath.TrimEnd('/')}/{id}", entry.Obo);
+        }, StringComparer.Ordinal);
         return new EntraProfiles(baseUri, profiles, servers, publicClients);
     }
 
@@ -93,15 +102,31 @@ internal sealed class EntraProfiles
         if (Regex.IsMatch(scope, @"\A[a-zA-Z0-9_.-]+\z", RegexOptions.CultureInvariant)) scope = $"api://{client:D}/{scope}";
         if (!IsScope(scope) || scope.EndsWith("/.default", StringComparison.OrdinalIgnoreCase)) throw Invalid(options.Path + ":Scope");
 
-        var exchangeClients = (options.GetSection("ExchangeClients").Get<string[]>() ?? []).Select(value =>
-            Guid.TryParseExact(value, "D", out var id) && id != Guid.Empty ? id.ToString("D") : throw Invalid(options.Path + ":ExchangeClients"))
-            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var exchangeClients = ReadClients(options, "ExchangeClients");
+        var directBearerClients = ReadClients(options, "DirectBearerClients");
+        var v1Audience = app["Audience"];
+        if (v1Audience != scope[..scope.LastIndexOf('/')] && v1Audience != client.ToString("D"))
+        {
+            if (directBearerClients.Count > 0)
+                throw Invalid(app.Path + ":Audience must be this API's application ID URI or client ID for direct v1 authentication");
+            v1Audience = null;
+        }
         var downstream = options.GetSection("DownstreamScopes").Get<Dictionary<string, string>>() ?? [];
-        if (downstream.Values.Any(value => !IsScope(value))) throw Invalid(options.Path + ":DownstreamScopes");
-        return new EntraProfile(name, tenant.ToString("D"), client.ToString("D"), secret, scope, exchangeClients, downstream);
+        if (downstream.Values.Any(value => !IsDownstreamScopeSet(value)))
+            throw Invalid(options.Path + ":DownstreamScopes");
+        return new EntraProfile(name, tenant.ToString("D"), client.ToString("D"), secret, scope, exchangeClients, v1Audience, directBearerClients, downstream);
     }
 
+    private static HashSet<string> ReadClients(IConfigurationSection options, string key) =>
+        (options.GetSection(key).Get<string[]>() ?? []).Select(value =>
+            Guid.TryParseExact(value, "D", out var id) && id != Guid.Empty ? id.ToString("D") : throw Invalid(options.Path + ":" + key))
+        .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
     private static bool IsScope(string value) => value.Length <= 2048 && Regex.IsMatch(value, @"\A(api://|https://)[^\s?#]+/[a-zA-Z0-9_.-]+\z", RegexOptions.CultureInvariant);
+
+    private static bool IsDownstreamScopeSet(string value, string? requiredPrefix = null) => value.Length <= 2048 &&
+        value.Split(' ').All(scope => IsScope(scope) && (requiredPrefix is null ||
+            (scope.StartsWith(requiredPrefix, StringComparison.Ordinal) && !scope.EndsWith("/.default", StringComparison.OrdinalIgnoreCase))));
 
     private static bool TryWebUrl(string? value, out Uri? uri) => Uri.TryCreate(value, UriKind.Absolute, out uri) &&
         uri.IsWellFormedOriginalString() && (uri.Scheme == "https" || (uri.Scheme == "http" && uri.IsLoopback)) &&

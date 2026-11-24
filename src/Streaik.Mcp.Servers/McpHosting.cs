@@ -17,14 +17,22 @@ public static class McpHosting
 {
     public const string ProtocolVersion = "2026-07-28";
     private const string VersionHeader = "Mcp-Protocol-Version";
-    private static readonly ServerEntry[] Servers =
-    [
-        new("openai-images", "OpenAI-Images", "OpenAI Images", "1.0.0", "openai", "Authorization", "Bearer"),
-        new("google-images", "Google-Images", "Google Images", "1.0.0", "google", "x-goog-api-key"),
-        new("anthropic-skills", "Anthropic-Skills", "Anthropic Skills", "1.0.0", "anthropic", "x-api-key")
-    ];
+    private static readonly ServerEntry[] Servers = McpCatalog.Servers.Values.Where(entry => entry.Obo is null)
+        .Select(entry =>
+        {
+            var provider = entry.Id switch
+            {
+                "openai-images" => OpenAIProvider.Id,
+                "google-images" => "google",
+                "anthropic-skills" => "anthropic",
+                _ => throw new InvalidOperationException($"No provider implementation for '{entry.Id}'."),
+            };
+            var header = entry.Server.GetProperty("remotes")[0].GetProperty("headers")[0];
+            return new ServerEntry(entry, provider, header.GetProperty("name").GetString()!,
+                header.TryGetProperty("value", out var format) ? format.GetString()!.Split(' ')[0] : null);
+        }).ToArray();
 
-    public static IReadOnlyList<string> ServerIds { get; } = Array.AsReadOnly(Servers.Select(server => server.Id).ToArray());
+    public static IReadOnlyList<string> ServerIds { get; } = Array.AsReadOnly(Servers.Select(server => server.Catalog.Id).ToArray());
 
     public static IServiceCollection AddStreaikMcp(this IServiceCollection services, IConfiguration configuration, bool headerAuth)
     {
@@ -45,9 +53,9 @@ public static class McpHosting
             options.SessionMode = HttpServerSessionMode.Stateless;
             options.ConfigureSessionOptions = (context, session, _) =>
             {
-                var server = GetServer(context) ?? throw new InvalidOperationException("No MCP server is mapped for the endpoint.");
-                session.ServerInfo = new Implementation { Name = server.Name, Title = server.Title, Version = server.Version };
-                session.ToolCollection = Tools.For(server.Id);
+                var configure = context.GetEndpoint()?.Metadata.GetMetadata<Action<McpServerOptions>>()
+                    ?? throw new InvalidOperationException("No MCP server is mapped for the endpoint.");
+                configure(session);
                 return Task.CompletedTask;
             };
         });
@@ -66,32 +74,51 @@ public static class McpHosting
     {
         foreach (var server in Servers)
         {
-            var endpoint = app.MapMcp($"/{server.Id}");
-            endpoint.WithMetadata(server).RequireCors("StreaikMcp");
-            if (authorizationPolicy is not null)
-                endpoint.RequireAuthorization(authorizationPolicy);
-            configureServer?.Invoke(server.Id, endpoint);
-            endpoint.Add(builder =>
+            var id = server.Catalog.Id;
+            var endpoint = MapServer(app, id, authorizationPolicy, session =>
             {
-                var next = builder.RequestDelegate!;
-                builder.RequestDelegate = async context =>
-                {
-                    context.Response.Headers.CacheControl = "no-store";
-                    if (HttpMethods.IsPost(context.Request.Method) &&
-                        (!context.Request.Headers.TryGetValue(VersionHeader, out var values) || values.Count != 1 || values[0] != ProtocolVersion))
-                    {
-                        context.Response.StatusCode = StatusCodes.Status400BadRequest;
-                        await context.Response.WriteAsJsonAsync(new
-                        {
-                            jsonrpc = "2.0", id = (object?)null,
-                            error = new { code = -32022, message = $"MCP protocol {ProtocolVersion} is required.", data = new { supported = new[] { ProtocolVersion } } }
-                        }, context.RequestAborted);
-                        return;
-                    }
-                    await next(context);
-                };
-            });
+                session.ServerInfo = server.Catalog.CreateServerInfo();
+                session.ToolCollection = Tools.For(id);
+            }).WithMetadata(server);
+            configureServer?.Invoke(id, endpoint);
         }
+    }
+
+    // Opt-in transports must supply an authorization policy; the public sample only maps the built-ins above.
+    public static IEndpointConventionBuilder MapProtectedStreaikMcp(this WebApplication app, string id,
+        string authorizationPolicy, Action<McpServerOptions> configureSession)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(authorizationPolicy);
+        return MapServer(app, id, authorizationPolicy, configureSession);
+    }
+
+    private static IEndpointConventionBuilder MapServer(WebApplication app, string id, string? authorizationPolicy,
+        Action<McpServerOptions> configureSession)
+    {
+        var endpoint = app.MapMcp($"/{id}").WithMetadata(configureSession).RequireCors("StreaikMcp");
+        if (authorizationPolicy is not null)
+            endpoint.RequireAuthorization(authorizationPolicy);
+        endpoint.Add(builder =>
+        {
+            var next = builder.RequestDelegate!;
+            builder.RequestDelegate = async context =>
+            {
+                context.Response.Headers.CacheControl = "no-store";
+                if (HttpMethods.IsPost(context.Request.Method) &&
+                    (!context.Request.Headers.TryGetValue(VersionHeader, out var values) || values.Count != 1 || values[0] != ProtocolVersion))
+                {
+                    context.Response.StatusCode = StatusCodes.Status400BadRequest;
+                    await context.Response.WriteAsJsonAsync(new
+                    {
+                        jsonrpc = "2.0", id = (object?)null,
+                        error = new { code = -32022, message = $"MCP protocol {ProtocolVersion} is required.", data = new { supported = new[] { ProtocolVersion } } }
+                    }, context.RequestAborted);
+                    return;
+                }
+                await next(context);
+            };
+        });
+        return endpoint;
     }
 
     private static ServerEntry? GetServer(HttpContext context) => context.GetEndpoint()?.Metadata.GetMetadata<ServerEntry>();
@@ -114,5 +141,5 @@ public static class McpHosting
         }
     }
 
-    private sealed record ServerEntry(string Id, string Name, string Title, string Version, string Provider, string Header, string? Scheme = null);
+    private sealed record ServerEntry(McpCatalog.Entry Catalog, string Provider, string Header, string? Scheme);
 }

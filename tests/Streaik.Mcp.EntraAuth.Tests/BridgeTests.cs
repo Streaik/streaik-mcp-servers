@@ -31,6 +31,164 @@ public sealed class BridgeTests
     private const string Images = Base + "/google-images";
     private const string Default = Base + "/openai-images";
     private const string OtherDefault = Base + "/anthropic-skills";
+    private const string Mail = Base + "/microsoft-outlook-mail";
+    private const string LegacyAudience = "api://legacy-mcp.test";
+    private const string Inbox = "https://graph.microsoft.com/beta/me/mailFolders/Inbox/messages?$top=15&$select=id,subject,from,receivedDateTime,isRead";
+
+    [Fact]
+    public async Task AllowlistedDirectV1BearerListsOutlookResourcesAndUsesOBO()
+    {
+        await using var host = await Fixture.StartAsync(directV1: true);
+        var assertion = host.Entra.Jwt(LegacyAudience, Spa, v1: true);
+        var listed = await ReadRpc(await host.McpAsync(Mail, assertion, "resources/list"));
+        Assert.NotEmpty(listed.GetProperty("result").GetProperty("resources").EnumerateArray());
+        Assert.Equal(0, host.Graph.Calls);
+
+        var body = await ReadRpc(await host.McpAsync(Mail, assertion, "resources/read", Inbox, new() { ["uri"] = Inbox }));
+        Assert.Equal("graph-test-response", body.GetProperty("result").GetProperty("contents")[0].GetProperty("text").GetString());
+        Assert.Equal(assertion, host.Entra.LastForm["assertion"].ToString());
+        Assert.Equal(DefaultApp, host.Entra.LastForm["client_id"].ToString());
+        Assert.Equal("on_behalf_of", host.Entra.LastForm["requested_token_use"].ToString());
+        Assert.Equal(McpCatalog.Servers["microsoft-outlook-mail"].Obo![GraphReads.Target], host.Entra.LastForm["scope"].ToString());
+        Assert.Equal("downstream-token", host.Graph.LastBearer);
+        Assert.DoesNotContain("downstream-token", body.GetRawText());
+    }
+
+    [Fact]
+    public async Task DirectV1RejectsWrongAudienceCallerIssuerTenantScopeSignatureAndExpiry()
+    {
+        await using var host = await Fixture.StartAsync(directV1: true);
+        using var untrusted = new FakeEntra();
+        var valid = host.Entra.Jwt(LegacyAudience, Spa, v1: true);
+        var rejected = new[]
+        {
+            host.Entra.Jwt("https://graph.microsoft.com", Spa, v1: true),
+            host.Entra.Jwt(LegacyAudience, ImagesApp, v1: true),
+            host.Entra.Jwt(LegacyAudience, Spa, tenant: ImagesApp, v1: true),
+            host.Entra.Jwt(LegacyAudience, Spa, issuer: $"https://login.microsoftonline.com/{Tenant}/v2.0", v1: true),
+            host.Entra.Jwt(LegacyAudience, Spa, scope: "other", v1: true),
+            host.Entra.Jwt(LegacyAudience, Spa, scope: null, v1: true),
+            host.Entra.Jwt(LegacyAudience, Spa, expires: DateTime.UtcNow.AddMinutes(-1), v1: true),
+            untrusted.Jwt(LegacyAudience, Spa, v1: true),
+            host.Jwt(DefaultApp, Spa),
+            "mcp1.invalid",
+        };
+        foreach (var token in rejected)
+            Assert.Equal(HttpStatusCode.Unauthorized, (await host.McpAsync(Mail, token, "resources/list")).StatusCode);
+        Assert.Equal(HttpStatusCode.Unauthorized, (await host.McpAsync(Images, valid)).StatusCode);
+        Assert.Equal(0, host.Graph.Calls);
+    }
+
+    [Fact]
+    public async Task V1CanStillBeWrappedAndIsNotAcceptedDirectlyWithoutTheDirectAllowlist()
+    {
+        await using var host = await Fixture.StartAsync();
+        var assertion = host.Entra.Jwt(LegacyAudience, Spa, v1: true);
+        Assert.Equal(HttpStatusCode.Unauthorized, (await host.McpAsync(Mail, assertion, "resources/list")).StatusCode);
+        var wrapped = await ReadWrapped(await host.TokenAsync("default", Exchange(assertion, Mail)));
+        Assert.Equal(HttpStatusCode.OK, (await host.McpAsync(Mail, wrapped, "resources/list")).StatusCode);
+        Assert.Equal(HttpStatusCode.Unauthorized, (await host.McpAsync(Default, wrapped)).StatusCode);
+    }
+
+    [Theory]
+    [InlineData("microsoft-outlook-calendar", "https://graph.microsoft.com/beta/me/calendar/calendarView?startDateTime=2026-11-24T00%3A00%3A00Z&endDateTime=2026-11-25T00%3A00%3A00Z&$select=subject,start,end,location,organizer,isOnlineMeeting")]
+    [InlineData("microsoft-outlook-mail", "https://graph.microsoft.com/beta/me/mailFolders/Inbox/messages?$top=15&$select=id,subject,from,receivedDateTime,isRead")]
+    [InlineData("microsoft-onenote", "https://graph.microsoft.com/beta/me/onenote/pages/0-abcd!123/content")]
+    public async Task CatalogCapabilitiesReadThroughResourceBoundDelegation(string id, string uri)
+    {
+        await using var host = await Fixture.StartAsync();
+        var endpoint = Base + "/" + id;
+        Assert.Equal(HttpStatusCode.Unauthorized, (await host.McpAsync(endpoint, method: "resources/list")).StatusCode);
+        var metadata = await host.Client.GetFromJsonAsync<JsonElement>("/.well-known/oauth-protected-resource/team/mcp/" + id);
+        Assert.Equal(endpoint, metadata.GetProperty("resource").GetString());
+        Assert.Equal(Base + "/oauth/default", metadata.GetProperty("authorization_servers")[0].GetString());
+        var assertion = host.Jwt(DefaultApp, Spa);
+        var token = await ReadWrapped(await host.TokenAsync("default", Exchange(assertion, endpoint)));
+        Assert.Equal(HttpStatusCode.Unauthorized, (await host.McpAsync(Default, token)).StatusCode);
+        var another = McpCatalog.Servers.Values.First(entry => entry.Obo is not null && entry.Id != id);
+        Assert.Equal(HttpStatusCode.Unauthorized, (await host.McpAsync(Base + "/" + another.Id, token, "resources/list")).StatusCode);
+
+        var definition = McpCatalog.Servers[id].Capabilities;
+        var discovered = (await ReadRpc(await host.McpAsync(endpoint, token, "server/discover"))).GetProperty("result");
+        var capabilities = discovered.GetProperty("capabilities");
+        Assert.True(capabilities.TryGetProperty("resources", out _));
+        Assert.Equal(definition.GetProperty("prompts").GetArrayLength() > 0, capabilities.TryGetProperty("prompts", out _));
+        Assert.False(capabilities.TryGetProperty("tools", out _));
+        foreach (var (method, property) in new[] { ("resources/list", "resources"), ("resources/templates/list", "resourceTemplates") })
+        {
+            var result = (await ReadRpc(await host.McpAsync(endpoint, token, method))).GetProperty("result");
+            Assert.Equal("complete", result.GetProperty("resultType").GetString());
+            Assert.Equal("private", result.GetProperty("cacheScope").GetString());
+            Assert.Equal(0, result.GetProperty("ttlMs").GetInt64());
+            var listed = result.GetProperty(property);
+            Assert.True(JsonElement.DeepEquals(definition.GetProperty(property), listed), listed.GetRawText());
+        }
+
+        Assert.Equal(0, host.Graph.Calls);
+        var invalid = await ReadRpc(await host.McpAsync(endpoint, token, "resources/read", "https://graph.microsoft.com/beta/me", new() { ["uri"] = "https://graph.microsoft.com/beta/me" }));
+        Assert.True(invalid.TryGetProperty("error", out _));
+        Assert.Equal(0, host.Graph.Calls);
+
+        var body = await ReadRpc(await host.McpAsync(endpoint, token, "resources/read", uri, new() { ["uri"] = uri }));
+        var read = body.GetProperty("result");
+        Assert.Equal("complete", read.GetProperty("resultType").GetString());
+        Assert.Equal("private", read.GetProperty("cacheScope").GetString());
+        Assert.Equal(0, read.GetProperty("ttlMs").GetInt64());
+        var content = read.GetProperty("contents")[0];
+        Assert.Equal(uri, content.GetProperty("uri").GetString());
+        Assert.Equal(id == "microsoft-onenote" ? "text/plain" : "application/json", content.GetProperty("mimeType").GetString());
+        Assert.Equal("graph-test-response", content.GetProperty("text").GetString());
+        Assert.Equal(new Uri(uri), host.Graph.LastUri);
+        Assert.Equal("downstream-token", host.Graph.LastBearer);
+        Assert.DoesNotContain("downstream-token", body.GetRawText());
+        Assert.Equal(assertion, host.Entra.LastForm["assertion"].ToString());
+        Assert.Equal("on_behalf_of", host.Entra.LastForm["requested_token_use"].ToString());
+        Assert.Equal(DefaultApp, host.Entra.LastForm["client_id"].ToString());
+        Assert.Equal(McpCatalog.Servers[id].Obo![GraphReads.Target], host.Entra.LastForm["scope"].ToString());
+    }
+
+    [Fact]
+    public async Task CatalogPromptsKeepMetadataAndRenderOriginalText()
+    {
+        await using var host = await Fixture.StartAsync();
+        const string id = "microsoft-outlook-calendar";
+        const string name = "daily-agenda-with-context";
+        var endpoint = Base + "/" + id;
+        var token = await ReadWrapped(await host.TokenAsync("default", Exchange(host.Jwt(DefaultApp, Spa), endpoint)));
+        var list = await ReadRpc(await host.McpAsync(endpoint, token, "prompts/list"));
+        var original = McpCatalog.Servers[id].Capabilities.GetProperty("prompts")[0];
+        Assert.True(JsonElement.DeepEquals(original.GetProperty("template"), list.GetProperty("result").GetProperty("prompts")[0]));
+        var prompt = await ReadRpc(await host.McpAsync(endpoint, token, "prompts/get", name,
+            new() { ["name"] = name, ["arguments"] = new { date = "2026-11-24" } }));
+        Assert.Equal(original.GetProperty("prompt").GetString()!.Replace("{date}", "2026-11-24"),
+            prompt.GetProperty("result").GetProperty("messages")[0].GetProperty("content").GetProperty("text").GetString());
+    }
+
+    [Fact]
+    public async Task GraphRoutesAreAbsentFromHeaderAuthAndAnUnconfiguredBridge()
+    {
+        await using var noBridge = await Fixture.StartAsync(bridge: false);
+        await using var header = await Fixture.StartAsync(headerAuth: true);
+        foreach (var id in McpCatalog.Servers.Values.Where(entry => entry.Obo is not null).Select(entry => entry.Id))
+        {
+            Assert.Equal(HttpStatusCode.NotFound, (await noBridge.McpAsync("https://localhost/" + id, method: "resources/list")).StatusCode);
+            Assert.Equal(HttpStatusCode.NotFound, (await noBridge.Client.GetAsync("/.well-known/oauth-protected-resource/" + id)).StatusCode);
+            Assert.Equal(HttpStatusCode.NotFound, (await header.McpAsync("https://localhost/" + id, "provider-key", "resources/list")).StatusCode);
+        }
+    }
+
+    private static async Task<JsonElement> ReadRpc(HttpResponseMessage response)
+    {
+        using (response)
+        {
+            var value = await response.Content.ReadAsStringAsync();
+            Assert.True(response.IsSuccessStatusCode, value);
+            if (response.Content.Headers.ContentType?.MediaType == "text/event-stream")
+                value = value.Split('\n').Single(line => line.StartsWith("data: ", StringComparison.Ordinal))[6..].TrimEnd('\r');
+            using var json = JsonDocument.Parse(value);
+            return json.RootElement.Clone();
+        }
+    }
 
     [Fact]
     public async Task DefaultAndNamedProfilesPublishCanonicalDiscoveryAndRequireScopedWrappers()
@@ -161,30 +319,45 @@ public sealed class BridgeTests
         return json.RootElement.GetProperty("access_token").GetString()!;
     }
 
-    private sealed class Fixture(WebApplication app, HttpClient client, FakeEntra entra) : IAsyncDisposable
+    private sealed class Fixture(WebApplication app, HttpClient client, FakeEntra entra, FakeGraph graph) : IAsyncDisposable
     {
         internal HttpClient Client { get; } = client;
         internal FakeEntra Entra { get; } = entra;
+        internal FakeGraph Graph { get; } = graph;
 
-        internal static async Task<Fixture> StartAsync()
+        internal static async Task<Fixture> StartAsync(bool bridge = true, bool headerAuth = false, bool directV1 = false)
         {
             var entra = new FakeEntra();
+            var downstream = new FakeGraph();
             var builder = WebApplication.CreateSlimBuilder();
             builder.WebHost.UseUrls("http://127.0.0.1:0");
-            builder.Configuration.AddInMemoryCollection(new Dictionary<string, string?>
+            var config = new Dictionary<string, string?>
             {
                 ["Mcp:OAuth:PublicBaseUrl"] = Base, ["AzureAd:TenantId"] = Tenant, ["AzureAd:ClientId"] = DefaultApp,
                 ["AzureAd:ClientSecret"] = "default-test-secret", ["Mcp:OAuth:Profiles:default:ExchangeClients:0"] = Spa,
+                ["AzureAd:Audience"] = LegacyAudience, ["Mcp:EntraScope"] = LegacyAudience + "/access_as_user",
                 ["Mcp:OAuth:Profiles:images:TenantId"] = Tenant, ["Mcp:OAuth:Profiles:images:ClientId"] = ImagesApp,
                 ["Mcp:OAuth:Profiles:images:ClientSecret"] = "images-test-secret", ["Mcp:OAuth:Profiles:images:ExchangeClients:0"] = Spa,
                 ["Mcp:OAuth:Profiles:images:DownstreamScopes:graph"] = "https://graph.microsoft.com/User.Read",
                 ["Mcp:OAuth:ServerProfiles:google-images"] = "images", ["Mcp:OAuth:PublicClients:test-client:0"] = Redirect,
-            });
+            };
+            if (directV1) config["Mcp:OAuth:Profiles:default:DirectBearerClients:0"] = Spa;
+            if (bridge) builder.Configuration.AddInMemoryCollection(config);
+            builder.Services.AddStreaikMcp(builder.Configuration, headerAuth);
+            if (headerAuth || !bridge)
+            {
+                var header = builder.Build();
+                header.UseCors();
+                header.MapStreaikMcp();
+                await header.StartAsync();
+                return new Fixture(header, new HttpClient { BaseAddress = new Uri(header.Urls.Single()) }, entra, downstream);
+            }
+
             var settings = EntraProfiles.Read(builder.Configuration)!;
-            builder.Services.AddStreaikMcp(builder.Configuration, headerAuth: false);
             builder.Services.AddMcpOAuth(settings);
             builder.Services.AddSingleton<IDataProtectionProvider, EphemeralDataProtectionProvider>();
             builder.Services.AddHttpClient(EntraTokens.HttpClientName).ConfigurePrimaryHttpMessageHandler(() => entra);
+            builder.Services.AddHttpClient(GraphReads.HttpClientName).ConfigurePrimaryHttpMessageHandler(() => downstream);
             var app = builder.Build();
             app.UsePathBase(settings.Prefix);
             app.UseRouting();
@@ -199,7 +372,7 @@ public sealed class BridgeTests
             }).WithMetadata(settings.Servers["google-images"]).RequireAuthorization(new AuthorizeAttribute { AuthenticationSchemes = McpBearerHandler.SchemeName });
             await app.StartAsync();
             return new Fixture(app, new HttpClient(new HttpClientHandler { AllowAutoRedirect = false, UseCookies = false })
-            { BaseAddress = new Uri(app.Urls.Single()) }, entra);
+            { BaseAddress = new Uri(app.Urls.Single()) }, entra, downstream);
         }
 
         internal string Jwt(string audience, string clientId, string scope = "access_as_user", string tenant = Tenant, DateTime? expires = null) =>
@@ -208,24 +381,22 @@ public sealed class BridgeTests
         internal Task<HttpResponseMessage> TokenAsync(string profile, Dictionary<string, string> form) =>
             Client.PostAsync($"/team/mcp/oauth/{profile}/token", new FormUrlEncodedContent(form));
 
-        internal Task<HttpResponseMessage> McpAsync(string endpoint, string? token = null)
+        internal Task<HttpResponseMessage> McpAsync(string endpoint, string? token = null, string method = "tools/list", string? name = null,
+            Dictionary<string, object>? parameters = null)
         {
             var request = Bearer(HttpMethod.Post, new Uri(endpoint).AbsolutePath, token);
             request.Headers.Add("Mcp-Protocol-Version", McpHosting.ProtocolVersion);
-            request.Headers.Add("Mcp-Method", "tools/list");
+            request.Headers.Add("Mcp-Method", method);
+            if (name is not null) request.Headers.Add("Mcp-Name", name);
             request.Headers.Accept.ParseAdd("application/json, text/event-stream");
-            request.Content = JsonContent.Create(new
+            parameters ??= new();
+            parameters["_meta"] = new Dictionary<string, object>
             {
-                jsonrpc = "2.0", id = 1, method = "tools/list", @params = new
-                {
-                    _meta = new Dictionary<string, object>
-                    {
-                        ["io.modelcontextprotocol/protocolVersion"] = McpHosting.ProtocolVersion,
-                        ["io.modelcontextprotocol/clientCapabilities"] = new { },
-                        ["io.modelcontextprotocol/clientInfo"] = new { name = "Bridge tests", version = "1.0.0" },
-                    },
-                },
-            });
+                ["io.modelcontextprotocol/protocolVersion"] = McpHosting.ProtocolVersion,
+                ["io.modelcontextprotocol/clientCapabilities"] = new { },
+                ["io.modelcontextprotocol/clientInfo"] = new { name = "Bridge tests", version = "1.0.0" },
+            };
+            request.Content = JsonContent.Create(new { jsonrpc = "2.0", id = 1, method, @params = parameters });
             return Client.SendAsync(request);
         }
 
@@ -241,6 +412,24 @@ public sealed class BridgeTests
             Client.Dispose();
             await app.DisposeAsync();
             Entra.Dispose();
+            Graph.Dispose();
+        }
+    }
+
+    private sealed class FakeGraph : HttpMessageHandler
+    {
+        internal int Calls { get; private set; }
+        internal Uri? LastUri { get; private set; }
+        internal string? LastBearer { get; private set; }
+
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            Assert.Equal(HttpMethod.Get, request.Method);
+            Assert.Equal("graph.microsoft.com", request.RequestUri!.Host);
+            Calls++;
+            LastUri = request.RequestUri;
+            LastBearer = request.Headers.Authorization?.Parameter;
+            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent("graph-test-response") });
         }
     }
 
@@ -249,20 +438,28 @@ public sealed class BridgeTests
         private readonly RSA _rsa = RSA.Create(2048);
         internal Dictionary<string, StringValues> LastForm { get; private set; } = [];
 
-        internal string Jwt(string audience, string clientId, string scope = "access_as_user", string tenant = Tenant, DateTime? expires = null) =>
-            new JsonWebTokenHandler().CreateToken(new SecurityTokenDescriptor
+        internal string Jwt(string audience, string clientId, string? scope = "access_as_user", string tenant = Tenant,
+            DateTime? expires = null, bool v1 = false, string? issuer = null)
+        {
+            var claims = new Dictionary<string, object> { [v1 ? "appid" : "azp"] = clientId, ["oid"] = User, ["tid"] = tenant,
+                ["ver"] = v1 ? "1.0" : "2.0" };
+            if (scope is not null) claims["scp"] = scope;
+            return new JsonWebTokenHandler().CreateToken(new SecurityTokenDescriptor
             {
-                Audience = audience, Issuer = $"https://login.microsoftonline.com/{tenant}/v2.0",
-                Claims = new Dictionary<string, object> { ["azp"] = clientId, ["scp"] = scope, ["oid"] = User, ["tid"] = tenant, ["ver"] = "2.0" },
+                Audience = audience, Issuer = issuer ?? (v1 ? $"https://sts.windows.net/{tenant}/" : $"https://login.microsoftonline.com/{tenant}/v2.0"),
+                Claims = claims,
                 NotBefore = DateTime.UtcNow.AddMinutes(-5), Expires = expires ?? DateTime.UtcNow.AddMinutes(10),
                 SigningCredentials = new SigningCredentials(new RsaSecurityKey(_rsa) { KeyId = "fake-entra" }, SecurityAlgorithms.RsaSha256),
             });
+        }
 
         protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
         {
             var path = request.RequestUri!.AbsolutePath;
             if (path.EndsWith("openid-configuration", StringComparison.Ordinal))
-                return Json(new { issuer = $"https://login.microsoftonline.com/{Tenant}/v2.0", jwks_uri = $"https://login.microsoftonline.com/{Tenant}/discovery/v2.0/keys" });
+                return path.Contains("/v2.0/", StringComparison.Ordinal)
+                    ? Json(new { issuer = $"https://login.microsoftonline.com/{Tenant}/v2.0", jwks_uri = $"https://login.microsoftonline.com/{Tenant}/discovery/v2.0/keys" })
+                    : Json(new { issuer = $"https://sts.windows.net/{Tenant}/", jwks_uri = $"https://login.microsoftonline.com/{Tenant}/discovery/keys" });
             if (path.EndsWith("/keys", StringComparison.Ordinal))
             {
                 var publicKey = _rsa.ExportParameters(false);

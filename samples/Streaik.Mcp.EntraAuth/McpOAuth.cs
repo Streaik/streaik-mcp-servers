@@ -26,6 +26,8 @@ internal static class McpOAuth
         services.AddSingleton<OAuthTransactions>();
         services.AddSingleton<IEntraTokens, EntraTokens>();
         services.AddScoped<IMcpOnBehalfOf, McpOnBehalfOf>();
+        if (settings.Servers.Keys.Any(id => GraphMcp.Find(id) is not null))
+            GraphReads.Add(services);
         services.AddHttpClient(EntraTokens.HttpClientName, client =>
         {
             client.Timeout = TimeSpan.FromSeconds(15);
@@ -40,6 +42,10 @@ internal static class McpOAuth
         app.MapStreaikMcp(Policy, (id, endpoint) => endpoint.WithMetadata(settings.Servers[id]));
 
         foreach (var (id, resource) in settings.Servers)
+        {
+            if (GraphMcp.Find(id) is { } graph)
+                app.MapProtectedStreaikMcp(id, Policy, graph.Configure).WithMetadata(resource);
+
             app.MapGet($"{EntraProfiles.ResourceMetadata}{settings.Prefix}/{id}", () => Results.Json(new
             {
                 resource = resource.Url,
@@ -47,6 +53,7 @@ internal static class McpOAuth
                 scopes_supported = new[] { resource.Profile.Scope },
                 bearer_methods_supported = new[] { "header" },
             })).RequireCors("StreaikMcp");
+        }
 
         foreach (var profile in settings.Profiles.Values)
         {
