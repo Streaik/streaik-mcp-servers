@@ -20,35 +20,38 @@ jobs:
         with:
           path: streaik-mcp-servers
 
-      - name: Checkout MCP catalog
-        uses: actions/checkout@v4
-        with:
-          repository: Streaik/streaik-mcp-catalog
-          path: streaik-mcp-catalog
-
-      - name: Checkout providers
-        uses: actions/checkout@v4
-        with:
-          repository: Streaik/streaik-providers
-          path: streaik-providers
+      - name: Checkout dependencies
+        run: |
+          set -e
+          for repo in \
+            streaik-mcp-catalog \
+            streaik-providers \
+            streaik-catalog \
+            streaik-openai \
+            streaik-chat-completions \
+            streaik-responses \
+            streaik-messages \
+            streaik-interactions \
+            streaik-vercel
+          do
+            git clone --depth 1 "https://github.com/Streaik/$repo.git" "$repo"
+          done
 
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: '11.0.x'
+          dotnet-version: "11.0.x"
 
       - name: Test
         working-directory: streaik-mcp-servers
         run: |
-          set -e
-          if [ -d tests ]; then
-            find tests -name '*.csproj' -print0 |
-              while IFS= read -r -d '' project; do
-                dotnet test "$project" -c Release
-              done
-          fi
+          set -euo pipefail
+          find tests -name '*.Tests.csproj' -print0 |
+            while IFS= read -r -d '' project; do
+              dotnet test "$project" -c Release
+            done
 
-      - name: Publish
+      - name: Publish HeaderAuth
         working-directory: streaik-mcp-servers
         run: |
           dotnet publish samples/Streaik.Mcp.HeaderAuth/Streaik.Mcp.HeaderAuth.csproj \
