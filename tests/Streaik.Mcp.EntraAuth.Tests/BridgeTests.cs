@@ -4,6 +4,7 @@ using System.Net.Http.Json;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.DataProtection;
@@ -18,7 +19,7 @@ using Streaik.Mcp.Servers;
 
 namespace Streaik.Mcp.EntraAuth.Tests;
 
-public sealed class BridgeTests
+public sealed partial class BridgeTests
 {
     private const string Base = "https://tools.example.test/team/mcp";
     private const string Tenant = "11111111-1111-4111-8111-111111111111";
@@ -177,12 +178,12 @@ public sealed class BridgeTests
         }
     }
 
-    private static async Task<JsonElement> ReadRpc(HttpResponseMessage response)
+    private static async Task<JsonElement> ReadRpc(HttpResponseMessage response, bool allowRpcError = false)
     {
         using (response)
         {
             var value = await response.Content.ReadAsStringAsync();
-            Assert.True(response.IsSuccessStatusCode, value);
+            if (!allowRpcError) Assert.True(response.IsSuccessStatusCode, value);
             if (response.Content.Headers.ContentType?.MediaType == "text/event-stream")
                 value = value.Split('\n').Single(line => line.StartsWith("data: ", StringComparison.Ordinal))[6..].TrimEnd('\r');
             using var json = JsonDocument.Parse(value);
@@ -331,6 +332,7 @@ public sealed class BridgeTests
             var downstream = new FakeGraph();
             var builder = WebApplication.CreateSlimBuilder();
             builder.WebHost.UseUrls("http://127.0.0.1:0");
+            builder.Configuration["Mcp:BrowserOrigins:0"] = "http://localhost:5174";
             var config = new Dictionary<string, string?>
             {
                 ["Mcp:OAuth:PublicBaseUrl"] = Base, ["AzureAd:TenantId"] = Tenant, ["AzureAd:ClientId"] = DefaultApp,
@@ -346,9 +348,20 @@ public sealed class BridgeTests
             builder.Services.AddStreaikMcp(builder.Configuration, headerAuth);
             if (headerAuth || !bridge)
             {
+                const string directPolicy = "FixtureDirectBearer";
+                if (!headerAuth)
+                {
+                    builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme).AddJwtBearer();
+                    builder.Services.AddAuthorizationBuilder().AddPolicy(directPolicy, policy => policy.RequireAuthenticatedUser());
+                }
                 var header = builder.Build();
                 header.UseCors();
-                header.MapStreaikMcp();
+                if (!headerAuth)
+                {
+                    header.UseAuthentication();
+                    header.UseAuthorization();
+                }
+                header.MapStreaikMcp(headerAuth ? null : directPolicy);
                 await header.StartAsync();
                 return new Fixture(header, new HttpClient { BaseAddress = new Uri(header.Urls.Single()) }, entra, downstream);
             }
@@ -381,23 +394,25 @@ public sealed class BridgeTests
         internal Task<HttpResponseMessage> TokenAsync(string profile, Dictionary<string, string> form) =>
             Client.PostAsync($"/team/mcp/oauth/{profile}/token", new FormUrlEncodedContent(form));
 
-        internal Task<HttpResponseMessage> McpAsync(string endpoint, string? token = null, string method = "tools/list", string? name = null,
-            Dictionary<string, object>? parameters = null)
+        internal async Task<HttpResponseMessage> McpAsync(string endpoint, string? token = null, string method = "tools/list", string? name = null,
+            Dictionary<string, object>? parameters = null, object? clientCapabilities = null, string? progressToken = null)
         {
-            var request = Bearer(HttpMethod.Post, new Uri(endpoint).AbsolutePath, token);
+            using var request = Bearer(HttpMethod.Post, new Uri(endpoint).AbsolutePath, token);
             request.Headers.Add("Mcp-Protocol-Version", McpHosting.ProtocolVersion);
             request.Headers.Add("Mcp-Method", method);
             if (name is not null) request.Headers.Add("Mcp-Name", name);
             request.Headers.Accept.ParseAdd("application/json, text/event-stream");
             parameters ??= new();
-            parameters["_meta"] = new Dictionary<string, object>
+            var metadata = new Dictionary<string, object>
             {
                 ["io.modelcontextprotocol/protocolVersion"] = McpHosting.ProtocolVersion,
-                ["io.modelcontextprotocol/clientCapabilities"] = new { },
+                ["io.modelcontextprotocol/clientCapabilities"] = clientCapabilities ?? new { },
                 ["io.modelcontextprotocol/clientInfo"] = new { name = "Bridge tests", version = "1.0.0" },
             };
+            if (progressToken is not null) metadata["progressToken"] = progressToken;
+            parameters["_meta"] = metadata;
             request.Content = JsonContent.Create(new { jsonrpc = "2.0", id = 1, method, @params = parameters });
-            return Client.SendAsync(request);
+            return await Client.SendAsync(request);
         }
 
         internal static HttpRequestMessage Bearer(HttpMethod method, string path, string? token)

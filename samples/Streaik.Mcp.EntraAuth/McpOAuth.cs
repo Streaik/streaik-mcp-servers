@@ -39,7 +39,10 @@ internal static class McpOAuth
 
     internal static void MapMcpOAuth(this WebApplication app, EntraProfiles settings)
     {
-        app.MapStreaikMcp(Policy, (id, endpoint) => endpoint.WithMetadata(settings.Servers[id]));
+        app.MapStreaikMcp(Policy, (id, endpoint) =>
+        {
+            if (settings.Servers.TryGetValue(id, out var resource)) endpoint.WithMetadata(resource);
+        });
 
         foreach (var (id, resource) in settings.Servers)
         {

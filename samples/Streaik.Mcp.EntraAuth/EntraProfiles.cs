@@ -77,7 +77,7 @@ internal sealed class EntraProfiles
             publicClients.Add(section.Key, redirects.ToHashSet(StringComparer.Ordinal));
         }
 
-        var servers = McpCatalog.Servers.ToDictionary(pair => pair.Key, pair =>
+        var servers = McpCatalog.Servers.Where(pair => !pair.Value.AllowAnonymous).ToDictionary(pair => pair.Key, pair =>
         {
             var (id, entry) = pair;
             if (entry.Obo is { } obo && (obo.Count != 1 || !obo.TryGetValue(GraphReads.Target, out var scopes) ||

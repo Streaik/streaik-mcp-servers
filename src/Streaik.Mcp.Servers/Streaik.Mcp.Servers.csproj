@@ -8,6 +8,7 @@
     <FrameworkReference Include="Microsoft.AspNetCore.App" />
     <EmbeddedResource Include="../../../streaik-mcp-catalog/servers/*.json" LogicalName="Streaik.Mcp.Catalog.%(Filename)%(Extension)" />
     <PackageReference Include="ModelContextProtocol.AspNetCore" Version="2.4.0" />
+    <PackageReference Include="RESTCountries.NET" Version="3.6.1" />
     <ProjectReference Include="../../../streaik-providers/src/Streaik.Providers/Streaik.Providers.csproj" />
   </ItemGroup>
 </Project>

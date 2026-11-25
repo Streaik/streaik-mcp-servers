@@ -17,19 +17,30 @@ public static class McpHosting
 {
     public const string ProtocolVersion = "2026-07-28";
     private const string VersionHeader = "Mcp-Protocol-Version";
+    private static readonly Dictionary<string, ServerDefinition> Implementations = new(StringComparer.Ordinal)
+    {
+        ["openai-images"] = new(OpenAIImages.CreateTools, OpenAIProvider.Id),
+        ["google-images"] = new(GoogleImages.CreateTools, "google"),
+        ["anthropic-skills"] = new(AnthropicSkills.CreateTools, "anthropic"),
+        ["github-rest-countries"] = new(RestCountries.CreateTools, Complete: RestCountries.Complete),
+        ["modelcontext-utils"] = new(ModelContextUtils.CreateTools),
+    };
+
     private static readonly ServerEntry[] Servers = McpCatalog.Servers.Values.Where(entry => entry.Obo is null)
         .Select(entry =>
         {
-            var provider = entry.Id switch
+            if (!Implementations.TryGetValue(entry.Id, out var implementation))
+                throw new InvalidOperationException($"No MCP implementation for '{entry.Id}'.");
+
+            CredentialHeader? credentials = null;
+            if (implementation.Provider is { } provider)
             {
-                "openai-images" => OpenAIProvider.Id,
-                "google-images" => "google",
-                "anthropic-skills" => "anthropic",
-                _ => throw new InvalidOperationException($"No provider implementation for '{entry.Id}'."),
-            };
-            var header = entry.Server.GetProperty("remotes")[0].GetProperty("headers")[0];
-            return new ServerEntry(entry, provider, header.GetProperty("name").GetString()!,
-                header.TryGetProperty("value", out var format) ? format.GetString()!.Split(' ')[0] : null);
+                var header = entry.Server.GetProperty("remotes")[0].GetProperty("headers")[0];
+                credentials = new(provider, header.GetProperty("name").GetString()!,
+                    header.TryGetProperty("value", out var format) ? format.GetString()!.Split(' ')[0] : null);
+            }
+
+            return new ServerEntry(entry, implementation, credentials, new CatalogPrompts(entry));
         }).ToArray();
 
     public static IReadOnlyList<string> ServerIds { get; } = Array.AsReadOnly(Servers.Select(server => server.Catalog.Id).ToArray());
@@ -78,8 +89,17 @@ public static class McpHosting
             var endpoint = MapServer(app, id, authorizationPolicy, session =>
             {
                 session.ServerInfo = server.Catalog.CreateServerInfo();
-                session.ToolCollection = Tools.For(id);
-            }).WithMetadata(server);
+                session.ServerInstructions = server.Catalog.Instructions;
+                session.ToolCollection = server.Implementation.CreateTools();
+                if (server.Credentials is null)
+                    foreach (var tool in session.ToolCollection)
+                        if (tool.ProtocolTool.Icons is not { Count: > 0 }) tool.ProtocolTool.Icons = session.ServerInfo.Icons;
+                if (server.Prompts.Any || server.Implementation.Complete is not null)
+                {
+                    session.Handlers = new McpServerHandlers { CompleteHandler = server.Implementation.Complete };
+                    server.Prompts.Configure(session.Handlers);
+                }
+            }, server.Catalog.AllowAnonymous).WithMetadata(server);
             configureServer?.Invoke(id, endpoint);
         }
     }
@@ -93,10 +113,12 @@ public static class McpHosting
     }
 
     private static IEndpointConventionBuilder MapServer(WebApplication app, string id, string? authorizationPolicy,
-        Action<McpServerOptions> configureSession)
+        Action<McpServerOptions> configureSession, bool allowAnonymous = false)
     {
         var endpoint = app.MapMcp($"/{id}").WithMetadata(configureSession).RequireCors("StreaikMcp");
-        if (authorizationPolicy is not null)
+        if (allowAnonymous)
+            endpoint.AllowAnonymous();
+        else if (authorizationPolicy is not null)
             endpoint.RequireAuthorization(authorizationPolicy);
         endpoint.Add(builder =>
         {
@@ -130,16 +152,21 @@ public static class McpHosting
         public string? GetApiKey(string providerId)
         {
             var context = accessor.HttpContext;
-            if (context is null || GetServer(context) is not { } server || server.Provider != providerId ||
-                !context.Request.Headers.TryGetValue(server.Header, out var values) || values.Count != 1 ||
+            if (context is null || GetServer(context)?.Credentials is not { } credential || credential.Provider != providerId ||
+                !context.Request.Headers.TryGetValue(credential.Name, out var values) || values.Count != 1 ||
                 values[0] is not { } value || string.IsNullOrWhiteSpace(value) || value.Length > 4096 || value.Contains(','))
                 return null;
 
-            return server.Scheme is null ? value.Trim()
+            return credential.Scheme is null ? value.Trim()
                 : AuthenticationHeaderValue.TryParse(value, out var auth) &&
-                    string.Equals(auth.Scheme, server.Scheme, StringComparison.OrdinalIgnoreCase) ? auth.Parameter : null;
+                    string.Equals(auth.Scheme, credential.Scheme, StringComparison.OrdinalIgnoreCase) ? auth.Parameter : null;
         }
     }
 
-    private sealed record ServerEntry(McpCatalog.Entry Catalog, string Provider, string Header, string? Scheme);
+    private sealed record ServerDefinition(Func<McpServerPrimitiveCollection<McpServerTool>> CreateTools, string? Provider = null,
+        McpRequestHandler<CompleteRequestParams, CompleteResult>? Complete = null);
+
+    private sealed record CredentialHeader(string Provider, string Name, string? Scheme);
+
+    private sealed record ServerEntry(McpCatalog.Entry Catalog, ServerDefinition Implementation, CredentialHeader? Credentials, CatalogPrompts Prompts);
 }

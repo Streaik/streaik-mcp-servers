@@ -14,6 +14,10 @@ public static class McpCatalog
 
     public sealed record Entry(string Id, JsonElement Server, JsonElement Capabilities, IReadOnlyDictionary<string, string>? Obo)
     {
+        public string? Instructions { get; init; }
+        public bool AllowAnonymous => Obo is null &&
+            (!Server.GetProperty("remotes")[0].TryGetProperty("headers", out var headers) || headers.GetArrayLength() == 0);
+
         public Implementation CreateServerInfo()
         {
             var info = Server.Deserialize<Implementation>(McpJsonUtilities.DefaultOptions)!;
@@ -38,7 +42,10 @@ public static class McpCatalog
                 throw new InvalidOperationException($"The bundled MCP transport URL must match its catalog filename: '{id}'.");
             var obo = entry.TryGetProperty("obo", out var value)
                 ? new ReadOnlyDictionary<string, string>(value.Deserialize<Dictionary<string, string>>()!) : null;
-            entries.Add(id, new Entry(id, server.Clone(), entry.GetProperty("capabilities").Clone(), obo));
+            entries.Add(id, new Entry(id, server.Clone(), entry.GetProperty("capabilities").Clone(), obo)
+            {
+                Instructions = entry.TryGetProperty("instructions", out var instructions) ? instructions.GetString() : null,
+            });
         }
         if (entries.Count == 0) throw new InvalidOperationException("The bundled MCP catalog is missing.");
         return new ReadOnlyDictionary<string, Entry>(entries);
