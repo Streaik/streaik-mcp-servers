@@ -27,7 +27,7 @@ public sealed partial class BridgeTests
                 Assert.Equal(prompt, await form["prompt"].ReadAsStringAsync(ct));
                 Assert.Equal(model, await form["model"].ReadAsStringAsync(ct));
                 Assert.Equal("1536x1024", await form["size"].ReadAsStringAsync(ct));
-                Assert.Equal(ImageBytes, Convert.ToBase64String(await form["image"].ReadAsByteArrayAsync(ct)));
+                Assert.Equal(ImageBytes, Convert.ToBase64String(await form["image[]"].ReadAsByteArrayAsync(ct)));
             }
             else
             {
