@@ -217,12 +217,12 @@ public sealed partial class BridgeTests
         var defaultToken = await ReadWrapped(await host.TokenAsync("default", Exchange(host.Jwt(DefaultApp, Spa), Default)));
         Assert.Equal(HttpStatusCode.Unauthorized, (await host.McpAsync(OtherDefault, defaultToken)).StatusCode);
 
-        var delegated = await host.Client.SendAsync(Fixture.Bearer(HttpMethod.Get, new Uri(Base + "/delegated").AbsolutePath + "?target=graph", wrapped));
+        var delegated = await host.Client.SendAsync(Fixture.Bearer(HttpMethod.Get, new Uri(Base + "/delegated").AbsolutePath + "?target=graph.microsoft.com", wrapped));
         Assert.Equal(HttpStatusCode.OK, delegated.StatusCode);
         Assert.Equal("downstream-token", await delegated.Content.ReadAsStringAsync());
         Assert.Equal(assertion, host.Entra.LastForm["assertion"].ToString());
         Assert.Equal(ImagesApp, host.Entra.LastForm["client_id"].ToString());
-        Assert.Equal("https://graph.microsoft.com/User.Read", host.Entra.LastForm["scope"].ToString());
+        Assert.Equal("https://graph.microsoft.com/Files.ReadWrite", host.Entra.LastForm["scope"].ToString());
         Assert.Equal("on_behalf_of", host.Entra.LastForm["requested_token_use"].ToString());
         Assert.Equal(HttpStatusCode.Forbidden, (await host.Client.SendAsync(Fixture.Bearer(HttpMethod.Get,
             new Uri(Base + "/delegated").AbsolutePath + "?target=unconfigured", wrapped))).StatusCode);
@@ -326,7 +326,8 @@ public sealed partial class BridgeTests
         internal FakeEntra Entra { get; } = entra;
         internal FakeGraph Graph { get; } = graph;
 
-        internal static async Task<Fixture> StartAsync(bool bridge = true, bool headerAuth = false, bool directV1 = false)
+        internal static async Task<Fixture> StartAsync(bool bridge = true, bool headerAuth = false, bool directV1 = false,
+            Dictionary<string, string?>? overrides = null, Action<IServiceCollection>? configureServices = null)
         {
             var entra = new FakeEntra();
             var downstream = new FakeGraph();
@@ -340,33 +341,27 @@ public sealed partial class BridgeTests
                 ["AzureAd:Audience"] = LegacyAudience, ["Mcp:EntraScope"] = LegacyAudience + "/access_as_user",
                 ["Mcp:OAuth:Profiles:images:TenantId"] = Tenant, ["Mcp:OAuth:Profiles:images:ClientId"] = ImagesApp,
                 ["Mcp:OAuth:Profiles:images:ClientSecret"] = "images-test-secret", ["Mcp:OAuth:Profiles:images:ExchangeClients:0"] = Spa,
-                ["Mcp:OAuth:Profiles:images:DownstreamScopes:graph"] = "https://graph.microsoft.com/User.Read",
                 ["Mcp:OAuth:ServerProfiles:google-images"] = "images", ["Mcp:OAuth:PublicClients:test-client:0"] = Redirect,
+                ["Providers:openai:ApiKey"] = "central-openai", ["Providers:google:ApiKey"] = "central-google",
+                ["DomainHeaders:api.anthropic.com:x-api-key"] = "central-anthropic",
             };
             if (directV1) config["Mcp:OAuth:Profiles:default:DirectBearerClients:0"] = Spa;
             if (bridge) builder.Configuration.AddInMemoryCollection(config);
-            builder.Services.AddStreaikMcp(builder.Configuration, headerAuth);
+            if (overrides is not null) builder.Configuration.AddInMemoryCollection(overrides);
+            var access = McpHosting.ResolveProviderAccess(builder.Configuration, headerAuth);
+            builder.Services.AddStreaikMcp(builder.Configuration, access);
+            configureServices?.Invoke(builder.Services);
             if (headerAuth || !bridge)
             {
-                const string directPolicy = "FixtureDirectBearer";
-                if (!headerAuth)
-                {
-                    builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme).AddJwtBearer();
-                    builder.Services.AddAuthorizationBuilder().AddPolicy(directPolicy, policy => policy.RequireAuthenticatedUser());
-                }
                 var header = builder.Build();
                 header.UseCors();
-                if (!headerAuth)
-                {
-                    header.UseAuthentication();
-                    header.UseAuthorization();
-                }
-                header.MapStreaikMcp(headerAuth ? null : directPolicy);
+                header.MapStreaikMcp();
+                header.MapStreaikMcpAccessMetadata(graphObo: false);
                 await header.StartAsync();
                 return new Fixture(header, new HttpClient { BaseAddress = new Uri(header.Urls.Single()) }, entra, downstream);
             }
 
-            var settings = EntraProfiles.Read(builder.Configuration)!;
+            var settings = EntraProfiles.Read(builder.Configuration, access)!;
             builder.Services.AddMcpOAuth(settings);
             builder.Services.AddSingleton<IDataProtectionProvider, EphemeralDataProtectionProvider>();
             builder.Services.AddHttpClient(EntraTokens.HttpClientName).ConfigurePrimaryHttpMessageHandler(() => entra);
@@ -378,11 +373,13 @@ public sealed partial class BridgeTests
             app.UseAuthentication();
             app.UseAuthorization();
             app.MapMcpOAuth(settings);
+            app.MapStreaikMcpAccessMetadata(graphObo: true);
+            if (settings.Servers.TryGetValue("google-images", out var images))
             app.MapGet("/delegated", async (string target, IMcpOnBehalfOf obo) =>
             {
                 try { return Microsoft.AspNetCore.Http.Results.Text(await obo.GetAccessTokenAsync(target)); }
                 catch (UnauthorizedAccessException) { return Microsoft.AspNetCore.Http.Results.StatusCode(403); }
-            }).WithMetadata(settings.Servers["google-images"]).RequireAuthorization(new AuthorizeAttribute { AuthenticationSchemes = McpBearerHandler.SchemeName });
+            }).WithMetadata(images).RequireAuthorization(new AuthorizeAttribute { AuthenticationSchemes = McpBearerHandler.SchemeName });
             await app.StartAsync();
             return new Fixture(app, new HttpClient(new HttpClientHandler { AllowAutoRedirect = false, UseCookies = false })
             { BaseAddress = new Uri(app.Urls.Single()) }, entra, downstream);
@@ -395,12 +392,14 @@ public sealed partial class BridgeTests
             Client.PostAsync($"/team/mcp/oauth/{profile}/token", new FormUrlEncodedContent(form));
 
         internal async Task<HttpResponseMessage> McpAsync(string endpoint, string? token = null, string method = "tools/list", string? name = null,
-            Dictionary<string, object>? parameters = null, object? clientCapabilities = null, string? progressToken = null)
+            Dictionary<string, object>? parameters = null, object? clientCapabilities = null, string? progressToken = null,
+            IReadOnlyDictionary<string, string>? headers = null)
         {
             using var request = Bearer(HttpMethod.Post, new Uri(endpoint).AbsolutePath, token);
             request.Headers.Add("Mcp-Protocol-Version", McpHosting.ProtocolVersion);
             request.Headers.Add("Mcp-Method", method);
             if (name is not null) request.Headers.Add("Mcp-Name", name);
+            if (headers is not null) foreach (var (key, value) in headers) request.Headers.Add(key, value);
             request.Headers.Accept.ParseAdd("application/json, text/event-stream");
             parameters ??= new();
             var metadata = new Dictionary<string, object>
@@ -452,6 +451,7 @@ public sealed partial class BridgeTests
     {
         private readonly RSA _rsa = RSA.Create(2048);
         internal Dictionary<string, StringValues> LastForm { get; private set; } = [];
+        internal bool DenyObo { get; set; }
 
         internal string Jwt(string audience, string clientId, string? scope = "access_as_user", string tenant = Tenant,
             DateTime? expires = null, bool v1 = false, string? issuer = null)
@@ -482,6 +482,8 @@ public sealed partial class BridgeTests
             }
             Assert.Equal($"/{Tenant}/oauth2/v2.0/token", path);
             LastForm = QueryHelpers.ParseQuery(await request.Content!.ReadAsStringAsync(cancellationToken));
+            if (DenyObo && LastForm["requested_token_use"] == "on_behalf_of")
+                return new HttpResponseMessage(HttpStatusCode.BadRequest) { Content = JsonContent.Create(new { error = "consent_required" }) };
             return Json(new { access_token = LastForm["grant_type"] == "authorization_code" ? Jwt(DefaultApp, DefaultApp) : "downstream-token" });
         }
 

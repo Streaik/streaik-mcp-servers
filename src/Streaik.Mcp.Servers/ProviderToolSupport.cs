@@ -46,9 +46,13 @@ internal static class ProviderToolSupport
         return name.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) ? RequiredText(name[prefix.Length..], 200) : name;
     }
 
-    internal static CallToolResult Image(string data, string mime, string? filename)
+    internal static async Task<CallToolResult> Image(IServiceProvider services, string data, string mime, string? filename,
+        ImageFolder? folder, CancellationToken ct)
     {
         var image = new ImageInput(mime, ImageInputs.Decode(data));
+        var files = services.GetRequiredService<DelegatedFiles>();
+        if (files.Enabled) return new() { Content = [await files.SaveImageAsync(image, filename, folder, ct)] };
+
         var block = ImageContentBlock.FromBytes(image.Bytes, image.Mime);
         return string.IsNullOrWhiteSpace(filename)
             ? new() { Content = [block] }
@@ -60,6 +64,15 @@ internal static class ProviderToolSupport
 
     internal static CallToolResult Failure(string message) => new() { IsError = true, Content = [new TextContentBlock { Text = message }] };
 
+    internal static Task<ImageFolder?> PrepareImageOutput(IServiceProvider services, string provider, string? folderUrl, CancellationToken ct)
+    {
+        _ = Key(services, provider);
+        var files = services.GetRequiredService<DelegatedFiles>();
+        if (files.Enabled) return files.PrepareImageDestinationAsync(folderUrl, ct);
+        if (folderUrl is not null) throw new ArgumentException("Saving to a Microsoft folder requires Microsoft sign-in mode.");
+        return Task.FromResult<ImageFolder?>(null);
+    }
+
     internal static async Task<CallToolResult> Run(Func<CancellationToken, Task<CallToolResult>> action, CancellationToken ct)
     {
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
@@ -68,6 +81,7 @@ internal static class ProviderToolSupport
         catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
         catch (OperationCanceledException) { return Failure("The operation timed out."); }
         catch (ProviderCredentialException) { return Failure("The provider credential is missing."); }
+        catch (DelegatedFileException ex) { return Failure(ex.Message); }
         catch (ArgumentException ex) when (ex.ParamName is null) { return Failure(ex.Message); }
         catch (McpProviderException ex) { return Failure(ex.Message); }
         catch (HttpRequestException ex) { return Failure(ex.StatusCode is { } status

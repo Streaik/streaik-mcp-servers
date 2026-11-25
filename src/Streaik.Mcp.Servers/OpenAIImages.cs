@@ -22,23 +22,27 @@ internal static class OpenAIImages
     private static Task<CallToolResult> OpenAIImages_CreateImage(
         [Description("The image prompt.")] string prompt, IServiceProvider services, CancellationToken ct,
         string model = OpenAiImageModel, string? filename = null, string? size = "auto", string? quality = "auto",
-        string? background = "auto", string? moderation = "auto") => Run(async ct =>
+        string? background = "auto", string? moderation = "auto",
+        [Description("Optional SharePoint/OneDrive destination folder. Requires Microsoft sign-in mode; defaults to your OneDrive.")] string? outputFolderUrl = null) => Run(async ct =>
     {
+        var folder = await PrepareImageOutput(services, OpenAIProvider.Id, outputFolderUrl, ct);
         var provider = services.GetRequiredService<OpenAIProvider>();
         var image = await provider.GenerateImageAsync(new OpenAIImageGenerationRequest
         {
             Model = ImageModel(model), Prompt = RequiredText(prompt), Size = Size(size), Quality = quality,
             Background = background, Moderation = moderation, OutputFormat = "png", N = 1
         }, NoHeaders, ct);
-        return OpenAiImage(image, filename);
+        return await OpenAiImage(services, image, filename, folder, ct);
     }, ct);
 
     private static Task<CallToolResult> OpenAIImages_CreateImageEdit(
         [Description("The image prompt.")] string prompt,
-        [Description("An HTTPS image URL on a configured host or an inline image data URL.")] string fileUrl,
+        [Description("An allowed HTTPS image URL or inline data URL. SharePoint and OneDrive links require Microsoft sign-in mode.")] string fileUrl,
         IServiceProvider services, CancellationToken ct, string model = OpenAiImageModel, string? filename = null,
-        string? size = "auto", string? background = "auto", string? quality = "auto") => Run(async ct =>
+        string? size = "auto", string? background = "auto", string? quality = "auto",
+        [Description("Optional SharePoint/OneDrive destination folder. Requires Microsoft sign-in mode; defaults to your OneDrive.")] string? outputFolderUrl = null) => Run(async ct =>
     {
+        var folder = await PrepareImageOutput(services, OpenAIProvider.Id, outputFolderUrl, ct);
         var image = await services.GetRequiredService<ImageInputs>().ReadAsync(fileUrl, ct);
         using var stream = new MemoryStream(image.Bytes, writable: false);
         var input = new FormFile(stream, 0, stream.Length, "image", $"input.{image.Extension}")
@@ -48,14 +52,15 @@ internal static class OpenAIImages
             Model = ImageModel(model), Prompt = RequiredText(prompt), Size = Size(size), Background = background,
             Quality = quality, OutputFormat = "png", N = 1, ImageFiles = [input]
         }, NoHeaders, ct);
-        return OpenAiImage(result, filename);
+        return await OpenAiImage(services, result, filename, folder, ct);
     }, ct);
 
     private static Task<CallToolResult> OpenAIImages_AskImages(
         [Description("Question about the supplied images.")] string question,
-        [Description("Ordered image URLs or inline image data URLs.")] string[] imageUrls,
+        [Description("Ordered image URLs or inline data URLs. SharePoint and OneDrive links require Microsoft sign-in mode.")] string[] imageUrls,
         IServiceProvider services, CancellationToken ct, string model = "gpt-4.1") => Run(async ct =>
     {
+        _ = Key(services, OpenAIProvider.Id);
         var images = await services.GetRequiredService<ImageInputs>().ReadAsync(imageUrls, ct);
         var content = new List<ChatMessageContentPart> { new ChatMessageTextPart { Text = RequiredText(question) } };
         content.AddRange(images.Select(image => new ChatMessageImagePart { ImageUrl = new ChatMessageImageUrl { Url = image.DataUrl } }));
@@ -76,6 +81,8 @@ internal static class OpenAIImages
 
     private static string Size(string? size) => size switch { "square" => "1024x1024", "landscape" => "1536x1024", "portrait" => "1024x1536", _ => size ?? "auto" };
 
-    private static CallToolResult OpenAiImage(OpenAIImagesResponse response, string? filename) => response.Data?.FirstOrDefault()?.B64Json is { } data
-        ? Image(data, "image/png", filename) : Failure("OpenAI returned no inline image.");
+    private static Task<CallToolResult> OpenAiImage(IServiceProvider services, OpenAIImagesResponse response, string? filename,
+        ImageFolder? folder, CancellationToken ct) =>
+        response.Data?.FirstOrDefault()?.B64Json is { } data
+            ? Image(services, data, "image/png", filename, folder, ct) : Task.FromResult(Failure("OpenAI returned no inline image."));
 }

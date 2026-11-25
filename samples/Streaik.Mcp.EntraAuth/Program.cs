@@ -1,26 +1,13 @@
 using Azure.Identity;
 using Azure.Security.KeyVault.Secrets;
-using Microsoft.AspNetCore.Authentication.JwtBearer;
-using Microsoft.Identity.Web;
 using Streaik.Mcp.EntraAuth;
 using Streaik.Mcp.Servers;
 
-const string access = "Streaik.Mcp.Access";
 var builder = WebApplication.CreateBuilder(args);
 var configuration = builder.Configuration;
-var bridge = EntraProfiles.Read(configuration);
-if (bridge is not null)
-    builder.Services.AddMcpOAuth(bridge);
-else
-{
-    var scope = configuration["Mcp:EntraScope"] ?? "access_as_user";
-    builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
-        .AddMicrosoftIdentityWebApi(configuration.GetSection("AzureAd"));
-    builder.Services.AddAuthorizationBuilder().AddPolicy(access, policy => policy.RequireAuthenticatedUser()
-        .RequireAssertion(context => context.User.Claims.Where(claim => claim.Type is "scp" or "http://schemas.microsoft.com/identity/claims/scope")
-            .SelectMany(claim => claim.Value.Split(' ', StringSplitOptions.RemoveEmptyEntries)).Contains(scope, StringComparer.Ordinal)));
-}
 
+var secretNames = new[] { "openai", "google", "anthropic" }.ToDictionary(provider => provider,
+    provider => configuration[$"KeyVault:ProviderSecrets:{provider}"]);
 if (configuration["KeyVault:VaultUri"] is { Length: > 0 } vaultUri)
 {
     if (!Uri.TryCreate(vaultUri, UriKind.Absolute, out var vault) || vault.Scheme != "https" || vault.AbsolutePath != "/" ||
@@ -29,19 +16,32 @@ if (configuration["KeyVault:VaultUri"] is { Length: > 0 } vaultUri)
 
     var secrets = new SecretClient(vault, new DefaultAzureCredential());
     var keys = new Dictionary<string, string?>();
-    foreach (var provider in new[] { "openai", "google", "anthropic" })
-        if (configuration[$"KeyVault:ProviderSecrets:{provider}"] is { Length: > 0 } name)
-            keys[$"Providers:{provider}:ApiKey"] = (await secrets.GetSecretAsync(name)).Value.Value;
+    foreach (var (provider, name) in secretNames)
+        if (!string.IsNullOrWhiteSpace(name))
+        {
+            var key = (await secrets.GetSecretAsync(name)).Value.Value;
+            if (string.IsNullOrWhiteSpace(key)) throw new InvalidOperationException($"The configured Key Vault provider key for '{provider}' is empty.");
+            keys[$"Providers:{provider}:ApiKey"] = key;
+        }
     configuration.AddInMemoryCollection(keys);
 }
+else if (secretNames.Values.Any(name => !string.IsNullOrWhiteSpace(name)))
+    throw new InvalidOperationException("KeyVault:VaultUri is required when provider secrets are configured.");
 
-builder.Services.AddStreaikMcp(configuration, headerAuth: false);
+var access = McpHosting.ResolveProviderAccess(configuration);
+var bridge = EntraProfiles.Read(configuration, access);
+if (bridge is not null) builder.Services.AddMcpOAuth(bridge);
+builder.Services.AddStreaikMcp(configuration, access);
 var app = builder.Build();
 if (bridge is { Prefix.Length: > 0 }) app.UsePathBase(bridge.Prefix);
 app.UseRouting();
 app.UseCors();
-app.UseAuthentication();
-app.UseAuthorization();
-if (bridge is not null) app.MapMcpOAuth(bridge);
-else app.MapStreaikMcp(access);
+if (bridge is not null)
+{
+    app.UseAuthentication();
+    app.UseAuthorization();
+    app.MapMcpOAuth(bridge);
+}
+else app.MapStreaikMcp();
+app.MapStreaikMcpAccessMetadata(graphObo: bridge is not null);
 await app.RunAsync();

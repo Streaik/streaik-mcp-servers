@@ -2,7 +2,7 @@ using Microsoft.Extensions.Configuration;
 
 namespace Streaik.Mcp.Servers;
 
-internal sealed class ImageInputs(IHttpClientFactory clients, IConfiguration configuration)
+internal sealed class ImageInputs(IHttpClientFactory clients, IConfiguration configuration, DelegatedFiles delegated)
 {
     internal const int MaxImageBytes = 5 * 1024 * 1024;
     internal const int MaxImages = 4;
@@ -26,6 +26,9 @@ internal sealed class ImageInputs(IHttpClientFactory clients, IConfiguration con
                 throw new ArgumentException("Use a base64 image data URL.");
             return new(value[5..(comma - 7)], Decode(value[(comma + 1)..]));
         }
+
+        if (Uri.TryCreate(value, UriKind.Absolute, out var microsoft) && DelegatedFiles.IsMicrosoftHost(microsoft))
+            return await delegated.ReadImageAsync(microsoft, ct);
 
         var hosts = configuration.GetSection("Mcp:ImageHosts").Get<string[]>() ?? [];
         if (!Uri.TryCreate(value, UriKind.Absolute, out var url) || url.Scheme != "https" || !url.IsDefaultPort ||

@@ -33,7 +33,7 @@ public sealed partial class BridgeTests
         using var protectedRoute = await entra.McpAsync(Default, method: "server/discover");
         Assert.Equal(HttpStatusCode.Unauthorized, protectedRoute.StatusCode);
         using var protectedDirect = await direct.McpAsync("https://localhost/openai-images", method: "server/discover");
-        Assert.Equal(HttpStatusCode.Unauthorized, protectedDirect.StatusCode);
+        Assert.Equal(HttpStatusCode.OK, protectedDirect.StatusCode); // No central key: caller-header discovery, not OAuth.
 
         foreach (var (host, url) in new[] { (header, "https://localhost/" + id), (entra, endpoint), (direct, "https://localhost/" + id) })
         {

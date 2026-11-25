@@ -20,10 +20,13 @@ internal static class GoogleImages
     private static Task<CallToolResult> GoogleNanoBanana_CreateImage(
         [Description("The image prompt.")] string prompt, IServiceProvider services, CancellationToken ct,
         [Description("Gemini image generation model, e.g. gemini-nano-banana-2.1 or gemini-3.1-flash-lite-image.")] string model = GoogleImageModel,
-        string? fileUrl = null, [Description("Aspect ratio, e.g. 1:1 or 16:9. Omit for the model default.")] string? aspectRatio = null,
+        [Description("Optional inline image, allowed HTTPS image URL, or SharePoint/OneDrive link in Microsoft sign-in mode.")] string? fileUrl = null,
+        [Description("Aspect ratio, e.g. 1:1 or 16:9. Omit for the model default.")] string? aspectRatio = null,
         [Description("Case-sensitive resolution, e.g. 1K, 2K or 4K where supported. Flash Lite supports only 1K.")] string? imageSize = null,
-        string[]? referenceImageUrls = null) => Run(async ct =>
+        string[]? referenceImageUrls = null, [Description("Optional output image basename.")] string? filename = null,
+        [Description("Optional SharePoint/OneDrive destination folder. Requires Microsoft sign-in mode; defaults to your OneDrive.")] string? outputFolderUrl = null) => Run(async ct =>
     {
+        var folder = await PrepareImageOutput(services, "google", outputFolderUrl, ct);
         var urls = (fileUrl is null ? Enumerable.Empty<string>() : [fileUrl]).Concat(referenceImageUrls ?? []).ToArray();
         var input = await GoogleInput(services, urls, RequiredText(prompt), ct);
         var format = new JsonObject { ["type"] = "image", ["mime_type"] = "image/jpeg" };
@@ -32,14 +35,15 @@ internal static class GoogleImages
         var result = await GoogleInteraction(services, model, input, format, ct);
         var image = GoogleOutput(result).FirstOrDefault(block => (string?)block["type"] == "image");
         if (image?["data"]?.GetValue<string>() is not { } data) return Failure("Google returned no image.");
-        return Image(data, (string?)image["mime_type"] ?? "image/jpeg", null);
+        return await Image(services, data, (string?)image["mime_type"] ?? "image/jpeg", filename, folder, ct);
     }, ct);
 
     private static Task<CallToolResult> GoogleNanoBanana_AskImages(
         [Description("Question about the supplied images.")] string question,
-        [Description("Ordered image URLs or inline image data URLs.")] string[] imageUrls,
+        [Description("Ordered image URLs or inline data URLs. SharePoint and OneDrive links require Microsoft sign-in mode.")] string[] imageUrls,
         IServiceProvider services, CancellationToken ct, string model = "gemini-flash-latest") => Run(async ct =>
     {
+        _ = Key(services, "google");
         if (imageUrls.Length == 0) throw new ArgumentException("At least one image is required.");
         var result = await GoogleInteraction(services, model, await GoogleInput(services, imageUrls, RequiredText(question), ct), null, ct);
         return Text(string.Join("\n\n", GoogleOutput(result).Where(block => (string?)block["type"] == "text").Select(block => (string?)block["text"])));

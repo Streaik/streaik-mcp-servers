@@ -36,14 +36,18 @@ internal sealed class EntraProfiles
         PublicClients = publicClients;
     }
 
-    internal static EntraProfiles? Read(IConfiguration configuration)
+    internal static EntraProfiles? Read(IConfiguration configuration, McpProviderAccess access)
     {
         var bridge = configuration.GetSection("Mcp:OAuth");
         var profilesSection = bridge.GetSection("Profiles");
         var serverSection = bridge.GetSection("ServerProfiles");
         var publicClientsSection = bridge.GetSection("PublicClients");
         if (string.IsNullOrWhiteSpace(bridge["PublicBaseUrl"]) && !profilesSection.Exists() && !serverSection.Exists() && !publicClientsSection.Exists())
-            return null; // Existing deployments retain direct JWT authentication until the bridge is configured.
+        {
+            if (McpHosting.ServerIds.Any(access.IsManaged))
+                throw Invalid("Mcp:OAuth is required when a central provider key is configured");
+            return null;
+        }
 
         if (!TryWebUrl(bridge["PublicBaseUrl"], out var baseUri) || baseUri!.Query.Length != 0 ||
             !Regex.IsMatch(baseUri.AbsolutePath, @"\A(/[-a-zA-Z0-9._~]+)*/?\z", RegexOptions.CultureInvariant))
@@ -77,14 +81,19 @@ internal sealed class EntraProfiles
             publicClients.Add(section.Key, redirects.ToHashSet(StringComparer.Ordinal));
         }
 
-        var servers = McpCatalog.Servers.Where(pair => !pair.Value.AllowAnonymous).ToDictionary(pair => pair.Key, pair =>
+        var servers = McpCatalog.Servers.Where(pair => pair.Value.Obo is not null || access.IsManaged(pair.Key)).ToDictionary(pair => pair.Key, pair =>
         {
             var (id, entry) = pair;
             if (entry.Obo is { } obo && (obo.Count != 1 || !obo.TryGetValue(GraphReads.Target, out var scopes) ||
                 !IsDownstreamScopeSet(scopes, GraphReads.Origin + "/")))
                 throw Invalid($"MCP catalog OBO scopes for '{id}'");
+            // Shares resolution requires Files.ReadWrite even for input. Image outputs go to the signed-in user's drive.
+            var scopesForResource = entry.Obo ?? new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                [GraphReads.Target] = GraphReads.Origin + "/Files.ReadWrite",
+            };
             return new McpResource(profiles[assignments.GetValueOrDefault(id) ?? "default"], $"{baseUri.AbsoluteUri.TrimEnd('/')}/{id}",
-                $"{baseUri.GetLeftPart(UriPartial.Authority)}{ResourceMetadata}{baseUri.AbsolutePath.TrimEnd('/')}/{id}", entry.Obo);
+                $"{baseUri.GetLeftPart(UriPartial.Authority)}{ResourceMetadata}{baseUri.AbsolutePath.TrimEnd('/')}/{id}", scopesForResource);
         }, StringComparer.Ordinal);
         return new EntraProfiles(baseUri, profiles, servers, publicClients);
     }
