@@ -65,9 +65,11 @@ public sealed partial class BridgeTests
     }
 
     [Theory]
-    [InlineData(true)]
-    [InlineData(false)]
-    public async Task ManagedImageUsesProtectedInputAndReturnsOnlyAnAccessControlledDriveLink(bool google)
+    [InlineData(true, false)]
+    [InlineData(false, false)]
+    [InlineData(true, true)]
+    [InlineData(false, true)]
+    public async Task ManagedImageUsesProtectedInputAndReturnsOnlyAnAccessControlledDriveLink(bool google, bool elicit)
     {
         const string link = "https://team-my.sharepoint.com/personal/user/Image.png";
         using var graph = new ProviderStub(async (request, ct) =>
@@ -111,7 +113,32 @@ public sealed partial class BridgeTests
         var endpoint = google ? Images : Default;
         var token = await ManagedToken(host, endpoint);
         var tool = google ? "GoogleNanoBanana_CreateImage" : "OpenAIImages_CreateImageEdit";
-        var result = await ProviderCall(host, endpoint, tool, new { prompt = "Restyle", fileUrl = Photo }, token);
+        var arguments = new { prompt = "Restyle", fileUrl = Photo };
+        var parameters = Tool(tool, arguments);
+        JsonElement result;
+        if (elicit)
+        {
+            var initial = await CallWithForm();
+            Assert.Equal("input_required", initial.GetProperty("resultType").GetString());
+            Assert.DoesNotContain(Photo, initial.GetRawText());
+            AssertNoUpstreamCalls();
+            parameters["requestState"] = initial.GetProperty("requestState").GetString()!;
+            var key = google ? "imageGeneration" : "imageEdit";
+            foreach (var (action, message) in new[] { ("decline", "declined"), ("cancel", "cancelled") })
+            {
+                parameters["inputResponses"] = new Dictionary<string, object> { [key] = new { action } };
+                var rejected = await CallWithForm();
+                Assert.True(IsError(rejected), rejected.GetRawText());
+                Assert.Contains(message, rejected.GetProperty("content")[0].GetProperty("text").GetString());
+                AssertNoUpstreamCalls();
+            }
+            parameters["inputResponses"] = new Dictionary<string, object>
+            {
+                [key] = new { action = "accept", content = new { arguments.prompt, model = google ? "gemini-nano-banana-2.1" : "gpt-image-2.6-flare" } },
+            };
+            result = await CallWithForm();
+        }
+        else result = await ProviderCall(host, endpoint, tool, arguments, token);
         Assert.False(IsError(result), result.GetRawText());
         var content = Assert.Single(result.GetProperty("content").EnumerateArray());
         Assert.Equal("resource_link", content.GetProperty("type").GetString());
@@ -119,6 +146,16 @@ public sealed partial class BridgeTests
         Assert.Equal(1, provider.Calls);
         Assert.Equal(4, graph.Calls);
         Assert.Equal(1, download.Calls);
+
+        async Task<JsonElement> CallWithForm() => Result(await ReadRpc(await host.McpAsync(endpoint, token, "tools/call", tool,
+            parameters, clientCapabilities: FormCapability)));
+
+        void AssertNoUpstreamCalls()
+        {
+            Assert.Equal(0, provider.Calls);
+            Assert.Equal(0, graph.Calls);
+            Assert.Equal(0, download.Calls);
+        }
     }
 
     [Fact]

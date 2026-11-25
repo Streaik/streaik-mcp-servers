@@ -82,6 +82,7 @@ internal static class ProviderToolSupport
         catch (OperationCanceledException) { return Failure("The operation timed out."); }
         catch (ProviderCredentialException) { return Failure("The provider credential is missing."); }
         catch (DelegatedFileException ex) { return Failure(ex.Message); }
+        catch (ToolElicitationException ex) { return Failure(ex.Message); }
         catch (ArgumentException ex) when (ex.ParamName is null) { return Failure(ex.Message); }
         catch (McpProviderException ex) { return Failure(ex.Message); }
         catch (HttpRequestException ex) { return Failure(ex.StatusCode is { } status
