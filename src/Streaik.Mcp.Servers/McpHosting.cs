@@ -59,17 +59,20 @@ public static class McpHosting
             .ConfigurePrimaryHttpMessageHandler(ProviderHandler).AddHttpMessageHandler(() => new ProviderErrors("Google"));
         services.AddHttpClient("mcp-anthropic", c => c.BaseAddress = new Uri("https://api.anthropic.com/"))
             .ConfigurePrimaryHttpMessageHandler(ProviderHandler).AddHttpMessageHandler(() => new ProviderErrors("Anthropic"));
-        services.AddMcpServer(options => options.ProtocolVersion = ProtocolVersion).WithHttpTransport(options =>
-        {
-            options.SessionMode = HttpServerSessionMode.Stateless;
-            options.ConfigureSessionOptions = (context, session, _) =>
+        ResourceContentDecoding.AddServices(services);
+        services.AddMcpServer(options => options.ProtocolVersion = ProtocolVersion)
+            .WithRequestFilters(filters => filters.AddReadResourceFilter(ResourceContentDecoding.Filter))
+            .WithHttpTransport(options =>
             {
-                var configure = context.GetEndpoint()?.Metadata.GetMetadata<Action<McpServerOptions>>()
-                    ?? throw new InvalidOperationException("No MCP server is mapped for the endpoint.");
-                configure(session);
-                return Task.CompletedTask;
-            };
-        });
+                options.SessionMode = HttpServerSessionMode.Stateless;
+                options.ConfigureSessionOptions = (context, session, _) =>
+                {
+                    var configure = context.GetEndpoint()?.Metadata.GetMetadata<Action<McpServerOptions>>()
+                        ?? throw new InvalidOperationException("No MCP server is mapped for the endpoint.");
+                    configure(session);
+                    return Task.CompletedTask;
+                };
+            });
 
         var origins = configuration.GetSection("Mcp:BrowserOrigins").Get<string[]>() ?? [];
         services.AddCors(options => options.AddPolicy("StreaikMcp", policy => policy.WithOrigins(origins)

@@ -7,8 +7,12 @@
   <ItemGroup>
     <FrameworkReference Include="Microsoft.AspNetCore.App" />
     <EmbeddedResource Include="../../../streaik-mcp-catalog/servers/*.json" LogicalName="Streaik.Mcp.Catalog.%(Filename)%(Extension)" />
+    <PackageReference Include="HtmlAgilityPack" Version="1.13.1" />
+    <PackageReference Include="MimeKit" Version="5.0.0" />
     <PackageReference Include="ModelContextProtocol.AspNetCore" Version="2.4.0" />
+    <PackageReference Include="PdfPig" Version="0.1.16" />
     <PackageReference Include="RESTCountries.NET" Version="3.6.1" />
+    <PackageReference Include="RtfPipe" Version="2.0.7677.4303" />
     <ProjectReference Include="../../../streaik-providers/src/Streaik.Providers/Streaik.Providers.csproj" />
   </ItemGroup>
 </Project>
